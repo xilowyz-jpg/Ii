@@ -158,6 +158,20 @@ Note also that the drawdowns cluster at 20–22%: that is the kill switch
 latching at its 20% limit and stopping the system, which is exactly what it is
 there for.
 
+## Running it somewhere always-on
+
+The engine belongs on a small machine that never sleeps, not on a phone or
+tablet — Android suspends background processes, and a strategy defined by a
+two-hour daily window cannot afford to miss it. A 1 vCPU / 2 GB VPS is ample,
+and it is also the easiest place to run the multi-gigabyte data download.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/xilowyz-jpg/Ii/claude/salut-6jamph/scripts/setup-vps.sh | bash
+```
+
+See [`docs/vps-setup.md`](docs/vps-setup.md) for what to buy, connecting from a
+tablet, and why every long-running command belongs in `tmux`.
+
 ## Claude Code agents
 
 `.claude/agents/` holds five subagents for working on this codebase:
