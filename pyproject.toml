@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fxagents"
+version = "0.1.0"
+description = "Multi-agent forex trading system: backtesting and paper trading"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+live = ["requests>=2.31"]
+analysis = ["pandas>=2.0", "numpy>=1.24"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+fxagents = "fxagents.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
