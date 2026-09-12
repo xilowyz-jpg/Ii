@@ -60,13 +60,29 @@ def cmd_fetch(args) -> int:
                 state["last"] = pct
                 print(f"\r  {pct:>3}%  {hour:%Y-%m-%d %H}h", end="", flush=True)
 
-        fetcher = DukascopyFetcher(cache_dir=args.cache, on_progress=progress)
+        def retried(hour, attempt, exc) -> None:
+            print(f"\r  retry {attempt} for {hour:%Y-%m-%d %H}h: {exc}"[:110])
+
+        fetcher = DukascopyFetcher(
+            cache_dir=args.cache, on_progress=progress, on_retry=retried,
+            retries=args.retries, pause=args.pause,
+        )
         try:
             candles = fetcher.candles(symbol, start, end, args.granularity)
         except DukascopyError as exc:
             print(f"\n  failed: {exc}", file=sys.stderr)
             return 1
-        print("\r" + " " * 40, end="\r")
+        print("\r" + " " * 60, end="\r")
+
+        if fetcher.failures:
+            print(
+                f"  {len(fetcher.failures)} hour(s) could not be downloaded and are "
+                f"missing from the file.\n"
+                f"  Re-run the same command to retry just those -- everything else is "
+                f"cached.\n"
+                f"  First: {fetcher.failures[0][0]:%Y-%m-%d %H}h",
+                file=sys.stderr,
+            )
 
         if not candles:
             print("  no data returned -- check the dates and the instrument name",
@@ -413,6 +429,10 @@ def build_parser() -> argparse.ArgumentParser:
     fe.add_argument("--out", default="data", help="directory for the CSV files")
     fe.add_argument("--cache", default=".cache/dukascopy",
                     help="where raw hourly files are kept, so a re-run downloads nothing")
+    fe.add_argument("--retries", type=int, default=5,
+                    help="attempts per hour before recording it as a gap")
+    fe.add_argument("--pause", type=float, default=0.15,
+                    help="seconds between requests; raise it if the host throttles you")
     fe.set_defaults(func=cmd_fetch)
 
     ag = sub.add_parser("agents", help="describe the wired-up agent team")

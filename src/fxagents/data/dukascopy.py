@@ -66,6 +66,15 @@ class DukascopyError(RuntimeError):
     pass
 
 
+class TransientError(DukascopyError):
+    """A failure worth retrying: a timeout, a reset, a 5xx, a rate limit.
+
+    Separated from DukascopyError because the difference decides whether the
+    download waits and tries again or gives up. A truncated stream is a bug; a
+    connection reset at hour 9,000 of 18,000 is Tuesday.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class Tick:
     ts: datetime
@@ -221,20 +230,31 @@ def ticks_to_candles(ticks: Iterable[Tick], granularity: str) -> list[Candle]:
     return accumulator.candles()
 
 
+_SESSION = None
+
+
+def _session():
+    """One connection, reused. 18,000 fresh TLS handshakes is slower and ruder."""
+    global _SESSION
+    if _SESSION is None:
+        try:
+            import requests
+        except ImportError as exc:  # pragma: no cover - depends on the environment
+            raise DukascopyError(
+                "fetching needs `requests`: pip install 'fxagents[live]'"
+            ) from exc
+        _SESSION = requests.Session()
+        _SESSION.headers["User-Agent"] = "fxagents/0.1 (personal research)"
+    return _SESSION
+
+
 def _http_get(url: str, timeout: float) -> bytes:
     """Fetch one file. 404 means the hour does not exist, which is not an error."""
-    try:
-        import requests
-    except ImportError as exc:  # pragma: no cover - depends on the environment
-        raise DukascopyError(
-            "fetching needs `requests`: pip install 'fxagents[live]'"
-        ) from exc
+    import requests
 
+    session = _session()
     try:
-        response = requests.get(
-            url, timeout=timeout,
-            headers={"User-Agent": "fxagents/0.1 (personal research)"},
-        )
+        response = session.get(url, timeout=timeout)
     except requests.exceptions.ProxyError as exc:
         raise DukascopyError(
             f"a proxy refused the connection to datafeed.dukascopy.com.\n"
@@ -242,11 +262,15 @@ def _http_get(url: str, timeout: float) -> bytes:
             f"Run the fetch from a machine with direct internet access, or see "
             f"docs/getting-data.md for the alternatives.\n  ({exc})"
         ) from exc
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        raise TransientError(f"{url}: {exc}") from exc
     except requests.exceptions.RequestException as exc:
         raise DukascopyError(f"could not reach {url}: {exc}") from exc
 
     if response.status_code == 404:
         return b""
+    if response.status_code == 429 or response.status_code >= 500:
+        raise TransientError(f"{url} returned {response.status_code}")
     if response.status_code != 200:
         raise DukascopyError(f"{url} returned {response.status_code}")
     return response.content
@@ -263,9 +287,14 @@ class DukascopyFetcher:
     cache_dir: Path | str = ".cache/dukascopy"
     timeout: float = 30.0
     pause: float = 0.15                 # seconds between requests
+    retries: int = 5                    # attempts per hour before giving up on it
+    backoff: float = 1.0                # first wait, doubling each time
+    max_consecutive_failures: int = 12  # stop early if the host is simply refusing us
     get: Callable[[str, float], bytes] = _http_get
     sleep: Callable[[float], None] = time.sleep
     on_progress: Callable[[int, int, datetime], None] | None = None
+    on_retry: Callable[[datetime, int, Exception], None] | None = None
+    failures: list[tuple[datetime, str]] = field(default_factory=list)
 
     def _cache_path(self, instrument: str, hour: datetime) -> Path:
         return (
@@ -274,10 +303,35 @@ class DukascopyFetcher:
         )
 
     def fetch_hour(self, instrument: str, hour: datetime) -> bytes:
+        """One hour, from cache or from the network, retrying transient failures.
+
+        A three-year download is ~18,000 requests over 45 minutes. Timeouts and
+        resets in that span are not exceptional, they are certain -- so a single
+        one must never end the run.
+        """
         path = self._cache_path(instrument, hour)
         if path.exists():
             return path.read_bytes()
-        payload = self.get(hour_url(instrument, hour), self.timeout)
+
+        url = hour_url(instrument, hour)
+        wait = self.backoff
+        last: Exception | None = None
+
+        for attempt in range(1, self.retries + 1):
+            try:
+                payload = self.get(url, self.timeout)
+                break
+            except TransientError as exc:
+                last = exc
+                if self.on_retry:
+                    self.on_retry(hour, attempt, exc)
+                if attempt == self.retries:
+                    raise
+                self.sleep(wait)
+                wait *= 2
+        else:                                       # pragma: no cover - loop always breaks or raises
+            raise last                              # type: ignore[misc]
+
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
         if self.pause:
@@ -290,6 +344,8 @@ class DukascopyFetcher:
         point_value = point_value or point_value_for(instrument)
         hours = int((end - start).total_seconds() // 3600) + 1
         checked = False
+        consecutive = 0
+        self.failures = []
 
         for i in range(hours):
             hour = (start + timedelta(hours=i)).replace(minute=0, second=0, microsecond=0)
@@ -297,7 +353,29 @@ class DukascopyFetcher:
             # them locally avoids thousands of pointless requests per year.
             if hour.weekday() == 5 or (hour.weekday() == 6 and hour.hour < 21):
                 continue
-            ticks = decode_ticks(self.fetch_hour(instrument, hour), hour, point_value)
+
+            try:
+                payload = self.fetch_hour(instrument, hour)
+            except TransientError as exc:
+                # One hour that will not come is a gap to report, not a reason
+                # to throw away everything already downloaded. The cache means
+                # a later re-run costs only the hours that are still missing.
+                self.failures.append((hour, str(exc)))
+                consecutive += 1
+                if consecutive >= self.max_consecutive_failures:
+                    raise DukascopyError(
+                        f"{consecutive} hours in a row failed, the last with: {exc}\n"
+                        "The host is not just having a bad moment -- it is refusing "
+                        "this machine. Some providers block datacentre IP ranges. "
+                        "Try from a home connection, or see docs/getting-data.md "
+                        "for another source."
+                    ) from exc
+                if self.on_progress:
+                    self.on_progress(i + 1, hours, hour)
+                continue
+
+            consecutive = 0
+            ticks = decode_ticks(payload, hour, point_value)
             if ticks and not checked:
                 check_plausible(instrument, ticks, point_value)
                 checked = True

@@ -16,6 +16,7 @@ import pytest
 from fxagents.data.dukascopy import (
     DukascopyError,
     DukascopyFetcher,
+    TransientError,
     DukascopySource,
     Tick,
     check_plausible,
@@ -365,3 +366,129 @@ def test_the_accumulator_reports_how_many_bars_it_holds():
     acc = CandleAccumulator("M5")
     acc.add_many(ticks_at([(0, 2350.0), (299, 2351.0), (300, 2360.0)]))
     assert len(acc) == 2
+
+
+# ---- resilience ----------------------------------------------------------
+
+class FlakyFeed:
+    """Fails the first `fail_times` calls for each URL, then succeeds."""
+
+    def __init__(self, bodies: dict[str, bytes], fail_times: int,
+                 error: type[Exception] = TransientError):
+        self.bodies = bodies
+        self.fail_times = fail_times
+        self.error = error
+        self.attempts: dict[str, int] = {}
+
+    def __call__(self, url: str, timeout: float) -> bytes:
+        self.attempts[url] = self.attempts.get(url, 0) + 1
+        if self.attempts[url] <= self.fail_times:
+            raise self.error(f"{url}: simulated failure {self.attempts[url]}")
+        return self.bodies.get(url, b"")
+
+
+def test_a_transient_failure_is_retried_and_then_succeeds(tmp_path):
+    """A timeout at hour 9,000 of 18,000 must not end a 45-minute download."""
+    url = hour_url("XAU_USD", HOUR)
+    feed = FlakyFeed({url: payload([gold(0, 2350.0, 2349.9)])}, fail_times=2)
+    fetcher = fetcher_for(tmp_path, feed, retries=5, backoff=0.0)
+
+    ticks = decode_ticks(fetcher.fetch_hour("XAU_USD", HOUR), HOUR, 1000)
+    assert len(ticks) == 1
+    assert feed.attempts[url] == 3, "expected two failures then a success"
+
+
+def test_the_wait_between_retries_doubles(tmp_path):
+    waits: list[float] = []
+    url = hour_url("XAU_USD", HOUR)
+    feed = FlakyFeed({url: payload([gold(0, 2350.0, 2349.9)])}, fail_times=3)
+    fetcher = DukascopyFetcher(
+        cache_dir=tmp_path, get=feed, pause=0.0, retries=5, backoff=1.0,
+        sleep=waits.append,
+    )
+    fetcher.fetch_hour("XAU_USD", HOUR)
+    assert waits[:3] == [1.0, 2.0, 4.0]
+
+
+def test_giving_up_on_one_hour_does_not_lose_the_rest(tmp_path):
+    """The hour is recorded as a gap; the download carries on."""
+    bodies = {}
+    for i in range(4):
+        hour = HOUR + timedelta(hours=i)
+        if i != 1:                                   # hour 1 is never served
+            bodies[hour_url("XAU_USD", hour)] = payload([gold(0, 2350.0 + i, 2349.9 + i)])
+
+    class Broken:
+        def __call__(self, url, timeout):
+            if url not in bodies:
+                raise TransientError(f"{url}: down")
+            return bodies[url]
+
+    fetcher = fetcher_for(tmp_path, Broken(), retries=2, backoff=0.0)
+    bars = fetcher.candles("XAU_USD", HOUR, HOUR + timedelta(hours=3), "M5")
+
+    assert bars, "the good hours were thrown away with the bad one"
+    assert len(fetcher.failures) == 1
+    failed_hour, message = fetcher.failures[0]
+    assert failed_hour == HOUR + timedelta(hours=1)
+    assert "down" in message
+
+
+def test_a_host_that_refuses_everything_stops_early_with_a_diagnosis(tmp_path):
+    """Better than spending 45 minutes producing an empty file."""
+    class Refusing:
+        def __call__(self, url, timeout):
+            raise TransientError("connection reset by peer")
+
+    fetcher = fetcher_for(tmp_path, Refusing(), retries=1, backoff=0.0,
+                          max_consecutive_failures=5)
+    with pytest.raises(DukascopyError, match="refusing this machine"):
+        fetcher.candles("XAU_USD", HOUR, HOUR + timedelta(hours=20), "M5")
+
+
+def test_a_successful_hour_resets_the_consecutive_failure_count(tmp_path):
+    """Scattered failures are normal; only an unbroken run means we are blocked."""
+    good = {}
+    for i in range(0, 12, 2):                        # every other hour works
+        good[hour_url("XAU_USD", HOUR + timedelta(hours=i))] = payload(
+            [gold(0, 2350.0, 2349.9)]
+        )
+
+    class Alternating:
+        def __call__(self, url, timeout):
+            if url not in good:
+                raise TransientError("flaky")
+            return good[url]
+
+    fetcher = fetcher_for(tmp_path, Alternating(), retries=1, backoff=0.0,
+                          max_consecutive_failures=3)
+    bars = fetcher.candles("XAU_USD", HOUR, HOUR + timedelta(hours=11), "M5")
+    assert bars
+    assert 0 < len(fetcher.failures) < 12
+
+
+def test_a_genuine_bug_is_not_retried(tmp_path):
+    """A corrupt stream is a defect, not weather -- retrying it wastes time."""
+    class Corrupt:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, url, timeout):
+            self.calls += 1
+            return b"<html>not lzma</html>"
+
+    feed = Corrupt()
+    fetcher = fetcher_for(tmp_path, feed, retries=5, backoff=0.0)
+    with pytest.raises(DukascopyError, match="zero-indexed month"):
+        fetcher.candles("XAU_USD", HOUR, HOUR, "M5")
+    assert feed.calls == 1, "a decode bug was retried as though it were a timeout"
+
+
+def test_retries_are_reported_so_a_slow_run_is_explainable(tmp_path):
+    seen: list[tuple[int, str]] = []
+    url = hour_url("XAU_USD", HOUR)
+    feed = FlakyFeed({url: payload([gold(0, 2350.0, 2349.9)])}, fail_times=2)
+    fetcher = fetcher_for(tmp_path, feed, retries=5, backoff=0.0,
+                          on_retry=lambda hour, attempt, exc: seen.append((attempt, str(exc))))
+    fetcher.fetch_hour("XAU_USD", HOUR)
+    assert [a for a, _ in seen] == [1, 2]
