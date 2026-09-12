@@ -48,6 +48,7 @@ can blow up the account on its own.
 | `consensus_portfolio` | Confidence-weighted vote; needs agreement, not just a net score |
 | `risk_manager` | Sizing, stops, exposure caps, daily loss limit, drawdown kill switch |
 | `market_execution` | Submits the order; holds no opinion of its own |
+| `smc_five_star` | A Smart Money Concepts setup for gold — five conditions or no trade. Runs on its own; see [`docs/smc-five-star.md`](docs/smc-five-star.md) |
 
 Trend and mean-reversion are near-opposites by construction. That is deliberate:
 when they cancel out, the market is directionless and the right trade is none.
@@ -103,6 +104,10 @@ python -m fxagents.cli backtest \
 
 # one strategy at a time
 python -m fxagents.cli backtest --strategy breakout --instruments EUR_USD
+
+# the five-star SMC setup on gold, and what its detector actually finds
+python -m fxagents.cli backtest --strategy smc --instruments XAU_USD --granularity M5 --bars 130000
+python -m fxagents.cli smc-scan --instruments XAU_USD --granularity M5 --bars 130000 --near-misses 4
 
 # paper trade: replay history fast, or poll a live feed
 python -m fxagents.cli paper --instruments EUR_USD --replay
@@ -163,6 +168,8 @@ src/fxagents/
   types.py          Candle, Signal, Proposal, OrderIntent, Position, ClosedTrade
   instruments.py    pip sizes, unit rounding, quote→account conversion
   indicators.py     streaming SMA/EMA/RSI/ATR/Bollinger/Donchian/ADX
+  smc.py            swings, order blocks, fair value gaps, liquidity pools
+  timeframes.py     higher-timeframe bars built from one base feed
   journal.py        every decision and every refusal, with its reason
   runner.py         the one bar → one decision loop, shared by backtest and live
   presets.py        ready-made agent teams
@@ -181,7 +188,7 @@ pip install -e '.[dev]'
 PYTHONPATH=src python -m pytest tests/ -q
 ```
 
-116 tests. The ones that matter most:
+186 tests. The ones that matter most:
 
 - `tests/test_no_lookahead.py` — the system provably cannot act on the bar that
   produced its signal, even when the next bar gaps 100 pips away.
@@ -193,6 +200,11 @@ PYTHONPATH=src python -m pytest tests/ -q
 - `test_paper_trading_reproduces_the_backtest_on_the_same_data` — the live loop
   and the simulator agree exactly on identical input. Without that, a paper
   result means nothing.
+- `tests/test_smc.py` and `tests/test_smc_five_star.py` — every SMC primitive
+  checked against a hand-drawn figure, then the full setup broken one star at a
+  time so each refusal can be traced to the rule that caused it.
+- `tests/test_timeframes.py` — a higher-timeframe bar is invisible until it has
+  closed, so a multi-timeframe strategy cannot read a bar that has not finished.
 
 ## Status and honest limits
 

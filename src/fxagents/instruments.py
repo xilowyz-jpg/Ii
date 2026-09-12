@@ -87,6 +87,17 @@ CATALOGUE: dict[str, Instrument] = {
         Instrument.parse("EUR_GBP", typical_spread_pips=1.1),
         Instrument.parse("EUR_JPY", typical_spread_pips=1.4),
         Instrument.parse("GBP_JPY", typical_spread_pips=2.2),
+        # Metals. Gold is quoted to 2 decimals and a pip is 0.10, so a typical
+        # 25-cent retail spread is 2.5 pips. One unit is one troy ounce, and
+        # margin is nearer 5% than the 3.3% of a currency pair.
+        Instrument.parse(
+            "XAU_USD", pip_size=0.1, min_units=1.0,
+            typical_spread_pips=2.8, margin_rate=0.05,
+        ),
+        Instrument.parse(
+            "XAG_USD", pip_size=0.001, min_units=1.0,
+            typical_spread_pips=2.5, margin_rate=0.05,
+        ),
     ]
 }
 

@@ -24,7 +24,12 @@ ANCHORS: dict[str, float] = {
     "EUR_USD": 1.0850, "GBP_USD": 1.2700, "USD_JPY": 149.50, "USD_CHF": 0.8800,
     "AUD_USD": 0.6600, "USD_CAD": 1.3600, "NZD_USD": 0.6100, "EUR_GBP": 0.8540,
     "EUR_JPY": 162.20, "GBP_JPY": 189.90,
+    "XAU_USD": 2350.00, "XAG_USD": 28.50,
 }
+
+# Metals move a lot more than currency pairs; using the FX default would
+# generate a gold series calmer than EUR/USD, which is nonsense.
+ANNUAL_VOL: dict[str, float] = {"XAU_USD": 0.16, "XAG_USD": 0.28}
 
 
 def _is_market_open(ts: datetime) -> bool:
@@ -75,7 +80,8 @@ class SyntheticSource(DataSource):
 
         price = ANCHORS.get(inst.symbol, 1.0)
         bars_per_year = 365 * 24 * 60 / minutes
-        sigma = price * self.annual_vol / math.sqrt(bars_per_year)
+        annual_vol = ANNUAL_VOL.get(inst.symbol, self.annual_vol)
+        sigma = price * annual_vol / math.sqrt(bars_per_year)
 
         end = self.end or datetime(2024, 1, 1, tzinfo=timezone.utc)
         ts = end - timedelta(minutes=minutes * int(count * 1.45))  # slack for closed bars

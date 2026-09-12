@@ -18,7 +18,7 @@ from fxagents.data.base import align
 from fxagents.data.csv_source import CsvSource
 from fxagents.data.synthetic import SyntheticSource
 from fxagents.instruments import get_instrument
-from fxagents.presets import build_registry
+from fxagents.presets import build_registry, build_smc_registry
 from fxagents.runner import RunnerConfig
 
 SYNTHETIC_WARNING = (
@@ -60,12 +60,15 @@ def cmd_backtest(args) -> int:
             print(f"no data for {inst.symbol}", file=sys.stderr)
             return 1
 
-    registry = build_registry(
-        strategy=args.strategy,
-        risk_pct=args.risk,
-        sessions=tuple(_names(args.sessions)) if args.sessions else (),
-        max_open_positions=args.max_positions,
-    )
+    if args.strategy == "smc":
+        registry = build_smc_registry(risk_pct=args.risk, take_profit_r=args.take_profit_r)
+    else:
+        registry = build_registry(
+            strategy=args.strategy,
+            risk_pct=args.risk,
+            sessions=tuple(_names(args.sessions)) if args.sessions else (),
+            max_open_positions=args.max_positions,
+        )
     bt = Backtester(
         registry=registry,
         instruments=instruments,
@@ -117,8 +120,13 @@ def cmd_paper(args) -> int:
     instruments = [get_instrument(s) for s in symbols]
     source = _build_source(args)
 
+    registry = (
+        build_smc_registry(risk_pct=args.risk)
+        if args.strategy == "smc"
+        else build_registry(strategy=args.strategy, risk_pct=args.risk)
+    )
     session = PaperSession(
-        registry=build_registry(strategy=args.strategy, risk_pct=args.risk),
+        registry=registry,
         instruments=instruments,
         source=source,
         granularity=args.granularity,
@@ -152,8 +160,108 @@ def cmd_paper(args) -> int:
     return 0
 
 
+def cmd_smc_scan(args) -> int:
+    """Print what the five-star detector actually found, setup by setup.
+
+    The point is verification against your own chart. A backtest number for a
+    rule this specific is worthless until you have confirmed the detector marks
+    the same blocks you would mark by eye -- so this lists the completed setups
+    with their timestamps and zones, and the near-misses with the star that
+    stopped them.
+    """
+    from zoneinfo import ZoneInfo
+
+    from fxagents.agents.smc_five_star import SMCFiveStarAgent
+    from fxagents.agents.base import AgentContext
+    from fxagents.journal import Journal
+    from fxagents.types import AccountState
+
+    symbol = _symbols(args.instruments)[0]
+    instrument = get_instrument(symbol)
+    source = _build_source(args)
+    candles = source.candles(symbol, args.granularity, args.bars)
+    if not candles:
+        print(f"no data for {symbol}", file=sys.stderr)
+        return 1
+
+    agent = SMCFiveStarAgent(
+        ob_timeframe=args.ob_timeframe,
+        ma_period=args.ma_period,
+        max_liquidity_distance=args.liquidity_distance,
+        liquidity_tolerance=args.liquidity_tolerance,
+    )
+
+    # A 200 MA on the daily needs 200 daily closes before it says anything, and
+    # until then the bias gate is shut and nothing can trade. On M5 data that
+    # is ~57,000 bars of pure warmup -- easy to mistake for "the rule found
+    # nothing" when it is really "the rule never got to run".
+    from fxagents.timeframes import period_minutes
+
+    base_minutes = period_minutes(args.granularity)
+    slowest = max(period_minutes(tf) for tf in agent.bias_timeframes)
+    needed = agent.ma_period * slowest // base_minutes
+    if len(candles) < needed * 1.5:
+        print(
+            f"WARNING: {len(candles):,} bars is thin for a {agent.ma_period} MA on "
+            f"{'/'.join(agent.bias_timeframes)}.\n"
+            f"         The bias gate stays shut for the first ~{needed:,} bars, so most of\n"
+            f"         this run cannot trade at all. Use more history, a shorter\n"
+            f"         --ma-period, or faster bias timeframes.\n",
+            file=sys.stderr,
+        )
+    agent.on_start([instrument])
+    journal = Journal()
+    account = AccountState(args.currency, args.balance, args.balance)
+    for candle in candles:
+        agent.on_bar(AgentContext(
+            ts=candle.ts, instrument=instrument, candle=candle, history=[candle],
+            account=account, position=None, journal=journal,
+        ))
+
+    zone = ZoneInfo(agent.session_tz)
+    print(f"{symbol} {args.granularity}: {len(candles):,} bars, "
+          f"{candles[0].ts:%Y-%m-%d} to {candles[-1].ts:%Y-%m-%d}")
+    print(f"order blocks read on {args.ob_timeframe}; bias from "
+          f"{'/'.join(agent.bias_timeframes)} ma{args.ma_period}")
+    print(f"window {agent.session_start:%H:%M}-{agent.session_end:%H:%M} {agent.session_tz}\n")
+
+    if args.source == "synthetic":
+        print("NOTE: synthetic data has no real market structure. An order block\n"
+              "      detector will happily find 'setups' in noise. Use real data\n"
+              "      before reading anything into these.\n")
+
+    print("Where setups died")
+    print("-----------------")
+    total = sum(agent.failure_counts().values()) or 1
+    for reason, count in agent.failure_counts().items():
+        print(f"  {count:>7,}  {count / total:>5.1%}  {reason}")
+
+    complete = agent.complete_setups()
+    print(f"\nComplete 5-star setups: {len(complete)}")
+    if complete:
+        print("-" * 78)
+        for r in complete:
+            block = r.block
+            local = r.ts.astimezone(zone)
+            print(f"  {r.ts:%Y-%m-%d %H:%M} UTC  ({local:%H:%M} {local.tzname()})  "
+                  f"{r.bias.name.lower():7} block {block.bottom:.2f}-{block.top:.2f}  "
+                  f"stop {block.far_edge():.2f}")
+
+    if args.near_misses:
+        near = agent.near_misses(args.near_misses)
+        print(f"\nNear misses ({args.near_misses}+ stars): {len(near)}")
+        print("-" * 78)
+        for r in near[-args.show:]:
+            local = r.ts.astimezone(zone)
+            print(f"  {r.ts:%Y-%m-%d %H:%M} ({local:%H:%M} local)  {r.render()}")
+    return 0
+
+
 def cmd_agents(args) -> int:
-    registry = build_registry(strategy=args.strategy)
+    if args.strategy == "smc":
+        registry = build_smc_registry()
+    else:
+        registry = build_registry(strategy=args.strategy)
     print("Signal agents")
     for a in registry.signals:
         print(f"  - {a.name}")
@@ -181,7 +289,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--instruments", default="EUR_USD,GBP_USD,USD_JPY")
         sp.add_argument("--granularity", default="H1", help="M5 M15 M30 H1 H4 D")
         sp.add_argument("--bars", type=int, default=4000)
-        sp.add_argument("--strategy", default="all", choices=["all", "trend", "reversion", "breakout"])
+        sp.add_argument("--strategy", default="all",
+                        choices=["all", "trend", "reversion", "breakout", "smc"])
         sp.add_argument("--risk", type=float, default=0.01, help="fraction of equity per trade")
         sp.add_argument("--balance", type=float, default=10_000.0)
         sp.add_argument("--currency", default="USD")
@@ -196,6 +305,8 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument("--commission", type=float, default=0.0, help="account ccy per 1M units")
     bt.add_argument("--max-positions", type=int, default=3)
     bt.add_argument("--warmup", type=int, default=0, help="bars to observe before trading")
+    bt.add_argument("--take-profit-r", type=float, default=2.0,
+                    help="target as a multiple of the stop distance (smc strategy)")
     bt.add_argument("--trades", type=int, default=0, help="print the first N trades")
     bt.add_argument("--journal", type=int, default=0, help="print the last N journal entries")
     bt.add_argument("--export", help="write the equity curve to this CSV path")
@@ -209,8 +320,22 @@ def build_parser() -> argparse.ArgumentParser:
     pa.add_argument("--cycles", type=int, default=None, help="stop after N polls (default: run forever)")
     pa.set_defaults(func=cmd_paper)
 
+    sc = sub.add_parser("smc-scan", help="list the five-star setups found in the data")
+    common(sc)
+    sc.add_argument("--ob-timeframe", default="M15", help="timeframe the order blocks are read on")
+    sc.add_argument("--ma-period", type=int, default=200)
+    sc.add_argument("--liquidity-distance", type=float, default=10.0,
+                    help="how far behind a block liquidity still counts (price units)")
+    sc.add_argument("--liquidity-tolerance", type=float, default=0.5,
+                    help="how close two swings must be to count as equal")
+    sc.add_argument("--near-misses", type=int, default=0,
+                    help="also list setups reaching at least N stars")
+    sc.add_argument("--show", type=int, default=25, help="how many near misses to print")
+    sc.set_defaults(func=cmd_smc_scan)
+
     ag = sub.add_parser("agents", help="describe the wired-up agent team")
-    ag.add_argument("--strategy", default="all", choices=["all", "trend", "reversion", "breakout"])
+    ag.add_argument("--strategy", default="all",
+                    choices=["all", "trend", "reversion", "breakout", "smc"])
     ag.set_defaults(func=cmd_agents)
 
     return p
