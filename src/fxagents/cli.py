@@ -27,6 +27,71 @@ SYNTHETIC_WARNING = (
 )
 
 
+def _parse_date(text: str) -> "datetime":
+    from datetime import datetime, timezone
+
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"bad date {text!r}; use YYYY-MM-DD or YYYY-MM-DDTHH:MM"
+        ) from None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def cmd_fetch(args) -> int:
+    """Download real history and write it where `--source csv` will find it."""
+    from datetime import timezone
+
+    from fxagents.data.dukascopy import DukascopyError, DukascopyFetcher
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    start, end = args.start, args.end
+
+    for symbol in _symbols(args.instruments):
+        print(f"{symbol} {args.granularity}: {start:%Y-%m-%d} to {end:%Y-%m-%d}")
+
+        state = {"last": -1}
+
+        def progress(done: int, total: int, hour, state=state) -> None:
+            pct = int(done * 100 / max(total, 1))
+            if pct != state["last"] and pct % 5 == 0:
+                state["last"] = pct
+                print(f"\r  {pct:>3}%  {hour:%Y-%m-%d %H}h", end="", flush=True)
+
+        fetcher = DukascopyFetcher(cache_dir=args.cache, on_progress=progress)
+        try:
+            candles = fetcher.candles(symbol, start, end, args.granularity)
+        except DukascopyError as exc:
+            print(f"\n  failed: {exc}", file=sys.stderr)
+            return 1
+        print("\r" + " " * 40, end="\r")
+
+        if not candles:
+            print("  no data returned -- check the dates and the instrument name",
+                  file=sys.stderr)
+            return 1
+
+        path = out_dir / f"{symbol}_{args.granularity.upper()}.csv"
+        with path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["time", "open", "high", "low", "close", "volume"])
+            for c in candles:
+                writer.writerow([
+                    c.ts.astimezone(timezone.utc).isoformat(),
+                    f"{c.open:.5f}", f"{c.high:.5f}", f"{c.low:.5f}", f"{c.close:.5f}",
+                    f"{c.volume:.2f}",
+                ])
+
+        span_days = (candles[-1].ts - candles[0].ts).days or 1
+        print(
+            f"  {len(candles):,} bars  {candles[0].ts:%Y-%m-%d} to {candles[-1].ts:%Y-%m-%d}"
+            f"  ({len(candles) / span_days:,.0f}/day)  -> {path}"
+        )
+    return 0
+
+
 def _build_source(args):
     if args.source == "synthetic":
         return SyntheticSource(seed=args.seed)
@@ -36,6 +101,10 @@ def _build_source(args):
         from fxagents.data.oanda import OandaSource
 
         return OandaSource()
+    if args.source == "dukascopy":
+        from fxagents.data.dukascopy import DukascopySource
+
+        return DukascopySource()
     raise ValueError(f"unknown source {args.source!r}")
 
 
@@ -294,7 +363,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--risk", type=float, default=0.01, help="fraction of equity per trade")
         sp.add_argument("--balance", type=float, default=10_000.0)
         sp.add_argument("--currency", default="USD")
-        sp.add_argument("--source", default="synthetic", choices=["synthetic", "csv", "oanda"])
+        sp.add_argument("--source", default="synthetic",
+                        choices=["synthetic", "csv", "oanda", "dukascopy"])
         sp.add_argument("--data-dir", default="data")
         sp.add_argument("--seed", type=int, default=7)
 
@@ -332,6 +402,18 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also list setups reaching at least N stars")
     sc.add_argument("--show", type=int, default=25, help="how many near misses to print")
     sc.set_defaults(func=cmd_smc_scan)
+
+    fe = sub.add_parser("fetch", help="download real history into a CSV")
+    fe.add_argument("--instruments", default="XAU_USD")
+    fe.add_argument("--granularity", default="M5", help="M1 M5 M15 M30 H1 H4 D")
+    fe.add_argument("--from", dest="start", type=_parse_date, required=True,
+                    metavar="YYYY-MM-DD")
+    fe.add_argument("--to", dest="end", type=_parse_date, required=True,
+                    metavar="YYYY-MM-DD")
+    fe.add_argument("--out", default="data", help="directory for the CSV files")
+    fe.add_argument("--cache", default=".cache/dukascopy",
+                    help="where raw hourly files are kept, so a re-run downloads nothing")
+    fe.set_defaults(func=cmd_fetch)
 
     ag = sub.add_parser("agents", help="describe the wired-up agent team")
     ag.add_argument("--strategy", default="all",

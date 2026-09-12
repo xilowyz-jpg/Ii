@@ -122,8 +122,17 @@ python -m fxagents.cli backtest --export runs/equity.csv
 | Source | Flag | Notes |
 |---|---|---|
 | Synthetic | `--source synthetic` | Default. Offline, deterministic, no credentials |
+| Dukascopy | `fxagents fetch` | Free tick history back to the early 2000s, no account. The practical source for gold at M5 |
 | CSV | `--source csv --data-dir data` | Reads `EUR_USD_H1.csv`; matches headers by name, so column order and naming vary freely |
 | OANDA | `--source oanda` | Practice account. Needs `OANDA_API_TOKEN` — see `.env.example` |
+
+```bash
+# three years of gold at M5, cached so a re-run costs nothing
+fxagents fetch --instruments XAU_USD --granularity M5 --from 2022-01-01 --to 2024-12-31
+```
+
+See [`docs/getting-data.md`](docs/getting-data.md) for the alternatives and for
+what to check before trusting a file.
 
 > **The synthetic source is a plumbing test, not a market.** It is a
 > regime-switching random walk with realistic session volatility and a closed
@@ -176,7 +185,7 @@ src/fxagents/
   cli.py            backtest / paper / agents
   agents/           base contracts, signals, filters, portfolio, risk, execution
   brokers/          broker interface + the paper simulator
-  data/             synthetic, CSV, OANDA
+  data/             synthetic, CSV, OANDA, Dukascopy ticks
   backtest/         engine + performance metrics
   live/             paper-trading session loop
 ```
@@ -188,7 +197,7 @@ pip install -e '.[dev]'
 PYTHONPATH=src python -m pytest tests/ -q
 ```
 
-186 tests. The ones that matter most:
+213 tests. The ones that matter most:
 
 - `tests/test_no_lookahead.py` — the system provably cannot act on the bar that
   produced its signal, even when the next bar gaps 100 pips away.
