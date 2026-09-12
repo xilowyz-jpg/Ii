@@ -268,3 +268,100 @@ def test_the_source_returns_at_most_the_requested_bar_count(tmp_path):
     bars = source.candles("XAU_USD", "M5", count=10)
     assert len(bars) <= 10
     assert all(bars[i].ts > bars[i - 1].ts for i in range(1, len(bars)))
+
+
+# ---- memory --------------------------------------------------------------
+
+def _hourly_bodies(hours: int) -> dict[str, bytes]:
+    bodies = {}
+    for i in range(hours):
+        hour = HOUR + timedelta(hours=i)
+        if hour.weekday() == 5 or (hour.weekday() == 6 and hour.hour < 21):
+            continue
+        bodies[hour_url("XAU_USD", hour)] = payload(
+            [gold(s * 1000, 2350.0 + s % 7, 2349.9 + s % 7) for s in range(3_600)]
+        )
+    return bodies
+
+
+def _peaks(tmp_path, hours: int) -> tuple[int, int, int]:
+    """Peak bytes for streaming vs collecting over `hours`, and the tick count."""
+    import tracemalloc
+
+    fetcher = fetcher_for(tmp_path / str(hours), FakeFeed(_hourly_bodies(hours)))
+    end = HOUR + timedelta(hours=hours - 1)
+
+    tracemalloc.start()
+    fetcher.candles("XAU_USD", HOUR, end, "M5")
+    _, streamed = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    tracemalloc.start()
+    ticks = fetcher.ticks("XAU_USD", HOUR, end)
+    _, collected = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return streamed, collected, len(ticks)
+
+
+def test_aggregation_memory_does_not_grow_with_the_range(tmp_path):
+    """The property that makes a multi-year fetch possible on a small machine.
+
+    Three years of gold is tens of millions of ticks; holding them to
+    aggregate at the end costs gigabytes, and a 2 GB VPS would be killed
+    partway through a 45-minute download. So peak memory must be set by the
+    number of BARS, not the number of ticks -- flat as the range grows.
+    """
+    short_stream, short_collect, short_ticks = _peaks(tmp_path, 6)
+    long_stream, long_collect, long_ticks = _peaks(tmp_path, 96)
+
+    assert long_ticks > short_ticks * 5, "the fixture does not scale enough to prove anything"
+
+    assert long_stream < short_stream * 1.5, (
+        f"streaming grew from {short_stream:,} to {long_stream:,} bytes over "
+        f"{short_ticks:,} -> {long_ticks:,} ticks; the ticks are still being held"
+    )
+    assert long_collect > short_collect * 2, (
+        "the collecting path was expected to grow with the range; if it no "
+        "longer does, this test is measuring nothing"
+    )
+
+
+def test_streaming_and_collecting_produce_identical_bars(tmp_path):
+    """The optimisation must not change a single price."""
+    bodies = {}
+    for i in range(4):
+        hour = HOUR + timedelta(hours=i)
+        bodies[hour_url("XAU_USD", hour)] = payload(
+            [gold(s * 5_000, 2350.0 + (s % 11) * 0.1, 2349.9 + (s % 11) * 0.1)
+             for s in range(720)]
+        )
+    fetcher = fetcher_for(tmp_path, FakeFeed(bodies))
+    end = HOUR + timedelta(hours=3)
+
+    streamed = fetcher.candles("XAU_USD", HOUR, end, "M5")
+    collected = ticks_to_candles(fetcher.ticks("XAU_USD", HOUR, end), "M5")
+    assert streamed == collected
+
+
+def test_the_accumulator_keeps_the_first_and_last_price_by_time(tmp_path):
+    """Ticks may arrive out of order within a bar; open and close follow the clock."""
+    from fxagents.data.dukascopy import CandleAccumulator
+
+    acc = CandleAccumulator("M5")
+    for seconds, mid in [(120, 2355.0), (0, 2350.0), (240, 2352.0), (60, 2360.0)]:
+        acc.add(Tick(ts=HOUR + timedelta(seconds=seconds), bid=mid - 0.05, ask=mid + 0.05,
+                     bid_volume=1.0, ask_volume=1.0))
+
+    bar = acc.candles()[0]
+    assert bar.open == pytest.approx(2350.0)     # earliest, not first added
+    assert bar.close == pytest.approx(2352.0)    # latest, not last added
+    assert bar.high == pytest.approx(2360.0)
+    assert bar.low == pytest.approx(2350.0)
+
+
+def test_the_accumulator_reports_how_many_bars_it_holds():
+    from fxagents.data.dukascopy import CandleAccumulator
+
+    acc = CandleAccumulator("M5")
+    acc.add_many(ticks_at([(0, 2350.0), (299, 2351.0), (300, 2360.0)]))
+    assert len(acc) == 2

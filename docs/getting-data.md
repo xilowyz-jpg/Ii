@@ -33,6 +33,14 @@ cached under `.cache/dukascopy`, so a second run costs nothing and an
 interrupted run resumes where it stopped. Budget around 1-2 GB of cache for
 three years of gold ticks.
 
+**Memory.** The aggregation streams: ticks are folded into bars one hour at a
+time and then discarded, so peak memory is set by the number of bars rather
+than the number of ticks. Three years of M5 gold stays around 10 MB however
+many tens of millions of ticks went into it, which is what makes the fetch
+possible on a 1-2 GB machine. `DukascopyFetcher.ticks()` returns the whole list
+instead and is fine for a few days -- but a few years of it would need several
+gigabytes, so use `candles()` (what `fxagents fetch` calls) for long ranges.
+
 **If it fails with a proxy error**, the machine is behind an egress policy that
 blocks the host — some CI runners and managed environments do. Run the fetch
 from your own machine; the resulting CSV is all the system needs.

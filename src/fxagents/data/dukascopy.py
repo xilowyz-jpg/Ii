@@ -35,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Iterator
 
 from fxagents.data.base import DataSource, granularity_minutes
 from fxagents.types import Candle
@@ -152,38 +152,73 @@ def check_plausible(instrument: str, ticks: list[Tick], point_value: int) -> Non
     )
 
 
-def ticks_to_candles(ticks: Iterable[Tick], granularity: str) -> list[Candle]:
-    """Aggregate ticks into OHLC bars on mid prices.
+@dataclass(slots=True)
+class CandleAccumulator:
+    """Folds ticks into OHLC bars as they arrive, keeping only the bars.
 
-    Mid rather than bid: the simulator applies its own spread on top, and
-    charging the feed's spread as well would double-count the cost.
+    This exists for one reason: three years of gold is tens of millions of
+    ticks, and holding them to aggregate at the end costs several gigabytes --
+    more than a small VPS has. Feeding them through here instead keeps a fixed
+    five floats per BAR, so three years of M5 is about 20 MB however many ticks
+    produced it.
+
+    Ticks may arrive in any order within a bar; `open` and `close` track the
+    earliest and latest timestamps rather than the order they were added.
     """
-    minutes = granularity_minutes(granularity)
-    period = timedelta(minutes=minutes)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-    buckets: dict[datetime, list[float]] = {}
-    volumes: dict[datetime, float] = {}
-    for tick in ticks:
-        elapsed = int((tick.ts - epoch).total_seconds() // 60)
-        start = epoch + timedelta(minutes=(elapsed // minutes) * minutes)
-        buckets.setdefault(start, []).append(tick.mid)
-        volumes[start] = volumes.get(start, 0.0) + tick.bid_volume + tick.ask_volume
+    granularity: str
+    # start -> [open, high, low, close, volume, first_ts, last_ts]
+    _bars: dict[datetime, list] = field(default_factory=dict)
 
-    out: list[Candle] = []
-    for start in sorted(buckets):
-        prices = buckets[start]
-        out.append(
-            Candle(
-                ts=start,
-                open=prices[0],
-                high=max(prices),
-                low=min(prices),
-                close=prices[-1],
-                volume=round(volumes[start], 4),
-            )
-        )
-    return out
+    @property
+    def minutes(self) -> int:
+        return granularity_minutes(self.granularity)
+
+    def bucket(self, ts: datetime) -> datetime:
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        elapsed = int((ts - epoch).total_seconds() // 60)
+        return epoch + timedelta(minutes=(elapsed // self.minutes) * self.minutes)
+
+    def add(self, tick: Tick) -> None:
+        """Mid rather than bid: the simulator applies its own spread on top,
+        and charging the feed's as well would double-count the cost."""
+        start = self.bucket(tick.ts)
+        price = tick.mid
+        volume = tick.bid_volume + tick.ask_volume
+        bar = self._bars.get(start)
+        if bar is None:
+            self._bars[start] = [price, price, price, price, volume, tick.ts, tick.ts]
+            return
+        if price > bar[1]:
+            bar[1] = price
+        if price < bar[2]:
+            bar[2] = price
+        bar[4] += volume
+        if tick.ts < bar[5]:
+            bar[0], bar[5] = price, tick.ts
+        if tick.ts >= bar[6]:
+            bar[3], bar[6] = price, tick.ts
+
+    def add_many(self, ticks: Iterable[Tick]) -> None:
+        for tick in ticks:
+            self.add(tick)
+
+    def __len__(self) -> int:
+        return len(self._bars)
+
+    def candles(self) -> list[Candle]:
+        return [
+            Candle(ts=start, open=bar[0], high=bar[1], low=bar[2], close=bar[3],
+                   volume=round(bar[4], 4))
+            for start, bar in sorted(self._bars.items())
+        ]
+
+
+def ticks_to_candles(ticks: Iterable[Tick], granularity: str) -> list[Candle]:
+    """Aggregate ticks into OHLC bars on mid prices."""
+    accumulator = CandleAccumulator(granularity)
+    accumulator.add_many(ticks)
+    return accumulator.candles()
 
 
 def _http_get(url: str, timeout: float) -> bytes:
@@ -249,11 +284,11 @@ class DukascopyFetcher:
             self.sleep(self.pause)
         return payload
 
-    def ticks(self, instrument: str, start: datetime, end: datetime,
-              point_value: int | None = None) -> list[Tick]:
+    def iter_ticks(self, instrument: str, start: datetime, end: datetime,
+                   point_value: int | None = None) -> Iterator[Tick]:
+        """Yield ticks hour by hour, holding only one hour at a time."""
         point_value = point_value or point_value_for(instrument)
         hours = int((end - start).total_seconds() // 3600) + 1
-        out: list[Tick] = []
         checked = False
 
         for i in range(hours):
@@ -262,19 +297,36 @@ class DukascopyFetcher:
             # them locally avoids thousands of pointless requests per year.
             if hour.weekday() == 5 or (hour.weekday() == 6 and hour.hour < 21):
                 continue
-            payload = self.fetch_hour(instrument, hour)
-            ticks = decode_ticks(payload, hour, point_value)
+            ticks = decode_ticks(self.fetch_hour(instrument, hour), hour, point_value)
             if ticks and not checked:
                 check_plausible(instrument, ticks, point_value)
                 checked = True
-            out.extend(ticks)
+            yield from ticks
             if self.on_progress:
                 self.on_progress(i + 1, hours, hour)
-        return out
+
+    def ticks(self, instrument: str, start: datetime, end: datetime,
+              point_value: int | None = None) -> list[Tick]:
+        """Every tick in the range, as a list.
+
+        Convenient for a few hours and ruinous for a few years: gold prints
+        tens of millions of ticks a year, at roughly 80 bytes each in a list.
+        For anything longer than a few days use `candles`, which never holds
+        more than one hour of ticks at a time.
+        """
+        return list(self.iter_ticks(instrument, start, end, point_value))
 
     def candles(self, instrument: str, start: datetime, end: datetime,
                 granularity: str = "M5", point_value: int | None = None) -> list[Candle]:
-        return ticks_to_candles(self.ticks(instrument, start, end, point_value), granularity)
+        """Bars for the range, aggregated as the ticks stream in.
+
+        Memory is bounded by the number of BARS, not the number of ticks, so
+        three years of M5 gold costs about 20 MB regardless of how many ticks
+        went into it.
+        """
+        accumulator = CandleAccumulator(granularity)
+        accumulator.add_many(self.iter_ticks(instrument, start, end, point_value))
+        return accumulator.candles()
 
 
 @dataclass(slots=True)
