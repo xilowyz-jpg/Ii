@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+import time
 from pathlib import Path
 
 from fxagents import __version__
@@ -52,16 +53,30 @@ def cmd_fetch(args) -> int:
     for symbol in _symbols(args.instruments):
         print(f"{symbol} {args.granularity}: {start:%Y-%m-%d} to {end:%Y-%m-%d}")
 
-        state = {"last": -1}
+        state = {"last": -1, "start": time.monotonic()}
 
         def progress(done: int, total: int, hour, state=state) -> None:
             pct = int(done * 100 / max(total, 1))
-            if pct != state["last"] and pct % 5 == 0:
+            if pct != state["last"]:
                 state["last"] = pct
-                print(f"\r  {pct:>3}%  {hour:%Y-%m-%d %H}h", end="", flush=True)
+                elapsed = time.monotonic() - state["start"]
+                rate = done / elapsed if elapsed else 0
+                left = (total - done) / rate if rate else 0
+                print(
+                    f"  {pct:>3}%  {hour:%Y-%m-%d %H}h  "
+                    f"{done:,}/{total:,} hours  "
+                    f"~{left / 60:.0f} min left  "
+                    f"pause {fetcher.current_pause:.2f}s",
+                    flush=True,
+                )
 
         def retried(hour, attempt, exc) -> None:
-            print(f"\r  retry {attempt} for {hour:%Y-%m-%d %H}h: {exc}"[:110])
+            # Keep the tail: the status code or errno is at the END of the
+            # message, and truncating the front threw away the diagnosis.
+            detail = str(exc)
+            if len(detail) > 90:
+                detail = "..." + detail[-87:]
+            print(f"\r  retry {attempt} for {hour:%Y-%m-%d %H}h: {detail}")
 
         fetcher = DukascopyFetcher(
             cache_dir=args.cache, on_progress=progress, on_retry=retried,

@@ -492,3 +492,83 @@ def test_retries_are_reported_so_a_slow_run_is_explainable(tmp_path):
                           on_retry=lambda hour, attempt, exc: seen.append((attempt, str(exc))))
     fetcher.fetch_hour("XAU_USD", HOUR)
     assert [a for a, _ in seen] == [1, 2]
+
+
+# ---- adaptive throttling -------------------------------------------------
+
+def test_the_pause_grows_when_the_host_pushes_back(tmp_path):
+    """Retrying harder against a throttle makes it worse; slowing down fixes it.
+
+    Five attempts with a doubling wait costs ~15s per hour against 0.15s for
+    the request itself, so on a throttled host the retries, not the downloads,
+    become the entire runtime.
+    """
+    url = hour_url("XAU_USD", HOUR)
+    feed = FlakyFeed({url: payload([gold(0, 2350.0, 2349.9)])}, fail_times=3)
+    fetcher = fetcher_for(tmp_path, feed, retries=5, backoff=0.0)
+    fetcher.pause = 0.1
+
+    before = fetcher.current_pause
+    fetcher.fetch_hour("XAU_USD", HOUR)
+    assert fetcher.current_pause > before
+
+
+def test_the_pause_decays_again_once_the_host_recovers(tmp_path):
+    bodies = {
+        hour_url("XAU_USD", HOUR + timedelta(hours=i)): payload([gold(0, 2350.0, 2349.9)])
+        for i in range(40)
+    }
+
+    class RecoveringFeed:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self, url, timeout):
+            self.calls += 1
+            if self.calls <= 3:                    # a rough patch, then fine
+                raise TransientError("503")
+            return bodies.get(url, b"")
+
+    fetcher = fetcher_for(tmp_path, RecoveringFeed(), retries=6, backoff=0.0)
+    fetcher.pause = 0.1
+
+    fetcher.fetch_hour("XAU_USD", HOUR)
+    stressed = fetcher.current_pause
+    assert stressed > 0.1
+
+    for i in range(1, 40):
+        fetcher.fetch_hour("XAU_USD", HOUR + timedelta(hours=i))
+    assert fetcher.current_pause < stressed
+
+
+def test_the_pause_never_exceeds_its_ceiling(tmp_path):
+    class Refusing:
+        def __call__(self, url, timeout):
+            raise TransientError("503")
+
+    fetcher = fetcher_for(tmp_path, Refusing(), retries=30, backoff=0.0, max_pause=1.0)
+    fetcher.pause = 0.1
+    with pytest.raises(TransientError):
+        fetcher.fetch_hour("XAU_USD", HOUR)
+    assert fetcher.current_pause <= 1.0
+
+
+def test_the_pause_never_falls_below_the_configured_one(tmp_path):
+    bodies = {
+        hour_url("XAU_USD", HOUR + timedelta(hours=i)): payload([gold(0, 2350.0, 2349.9)])
+        for i in range(60)
+    }
+    fetcher = fetcher_for(tmp_path, FakeFeed(bodies), retries=3, backoff=0.0)
+    fetcher.pause = 0.2
+    for i in range(60):
+        fetcher.fetch_hour("XAU_USD", HOUR + timedelta(hours=i))
+    assert fetcher.current_pause >= 0.2
+
+
+def test_adaptation_can_be_switched_off(tmp_path):
+    url = hour_url("XAU_USD", HOUR)
+    feed = FlakyFeed({url: payload([gold(0, 2350.0, 2349.9)])}, fail_times=3)
+    fetcher = fetcher_for(tmp_path, feed, retries=5, backoff=0.0, adaptive_pause=False)
+    fetcher.pause = 0.1
+    fetcher.fetch_hour("XAU_USD", HOUR)
+    assert fetcher.current_pause == 0.1

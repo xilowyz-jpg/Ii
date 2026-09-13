@@ -290,11 +290,36 @@ class DukascopyFetcher:
     retries: int = 5                    # attempts per hour before giving up on it
     backoff: float = 1.0                # first wait, doubling each time
     max_consecutive_failures: int = 12  # stop early if the host is simply refusing us
+    # When the host throttles, retrying harder makes it worse: five attempts
+    # with a doubling wait costs 15s per hour, against 0.15s for the request
+    # itself. Slowing the request rate is what actually speeds the run up, so
+    # the pause grows on failure and decays back down when things go well.
+    adaptive_pause: bool = True
+    max_pause: float = 3.0
+    pause_growth: float = 1.6
+    pause_decay: float = 0.97
     get: Callable[[str, float], bytes] = _http_get
     sleep: Callable[[float], None] = time.sleep
     on_progress: Callable[[int, int, datetime], None] | None = None
     on_retry: Callable[[datetime, int, Exception], None] | None = None
     failures: list[tuple[datetime, str]] = field(default_factory=list)
+    _pause: float = field(default=-1.0, init=False)
+
+    @property
+    def current_pause(self) -> float:
+        """The pause actually in use, which adapts if the host throttles."""
+        return self.pause if self._pause < 0 else self._pause
+
+    def _slow_down(self) -> None:
+        if not self.adaptive_pause:
+            return
+        base = self.current_pause or 0.1
+        self._pause = min(base * self.pause_growth, self.max_pause)
+
+    def _speed_up(self) -> None:
+        if not self.adaptive_pause or self._pause < 0:
+            return
+        self._pause = max(self._pause * self.pause_decay, self.pause)
 
     def _cache_path(self, instrument: str, hour: datetime) -> Path:
         return (
@@ -323,6 +348,7 @@ class DukascopyFetcher:
                 break
             except TransientError as exc:
                 last = exc
+                self._slow_down()
                 if self.on_retry:
                     self.on_retry(hour, attempt, exc)
                 if attempt == self.retries:
@@ -334,8 +360,9 @@ class DukascopyFetcher:
 
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(payload)
-        if self.pause:
-            self.sleep(self.pause)
+        self._speed_up()
+        if self.current_pause:
+            self.sleep(self.current_pause)
         return payload
 
     def iter_ticks(self, instrument: str, start: datetime, end: datetime,
